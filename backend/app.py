@@ -1,4 +1,3 @@
-# app.py (fixed)
 import os
 import json
 import secrets
@@ -13,27 +12,22 @@ from flask_cors import CORS
 
 load_dotenv()
 
-# Configurable frontend url (where we send users after OAuth)
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8080").rstrip("/")
 
 app = Flask(__name__)
-# Allow only the frontend origin for API calls (keeps cookies working)
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": FRONTEND_URL}})
 
 app.secret_key = os.getenv("FLASK_SECRET", secrets.token_urlsafe(32))
 
-# Reddit / Gemini env
 CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
 CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDDIT_REDIRECT_URI", "http://localhost:5000/api/callback/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# Use a stable model id (adjust if you prefer another)
 GEMINI_URL = os.getenv(
     "GEMINI_URL",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
 )
 
-# Warn if important env missing
 missing = [k for k, v in {
     "REDDIT_CLIENT_ID": CLIENT_ID,
     "REDDIT_CLIENT_SECRET": CLIENT_SECRET,
@@ -61,17 +55,12 @@ def login():
     state = secrets.token_urlsafe(16)
     session["oauth_state"] = state
     scopes = ["identity", "read"]
-    # use keyword args to avoid PRAW deprecation warning
     auth_url = reddit.auth.url(scopes=scopes, state=state, duration="permanent")
     return redirect(auth_url)
 
 
 @app.route("/api/callback/")
 def callback():
-    """
-    Reddit sends the user here after consent. We exchange code -> refresh_token,
-    store it in server-side session and redirect user to the frontend selection page.
-    """
     reddit = get_reddit()
     error = request.args.get("error")
     if error:
@@ -86,11 +75,9 @@ def callback():
         return jsonify({"error": "missing_code"}), 400
 
     try:
-        # returns refresh token when duration="permanent"
         refresh_token = reddit.auth.authorize(code)
         session["refresh_token"] = refresh_token
         session.pop("oauth_state", None)
-        # send user to frontend subreddit selection (configurable via FRONTEND_URL)
         return redirect(f"{FRONTEND_URL}/select")
     except Exception as e:
         app.logger.exception("Failed to authorize reddit code")
@@ -141,31 +128,24 @@ def call_gemini(prompt: str) -> str:
         resp = requests.post(GEMINI_URL, headers=headers, params=params, json=body, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        # defensive extraction
         candidates = data.get("candidates") or data.get("output") or []
         if candidates and isinstance(candidates, list):
-            # try multiple shapes
             first = candidates[0]
             content = first.get("content") if isinstance(first, dict) else None
             if content and isinstance(content, dict):
                 parts = content.get("parts", [])
                 if parts:
                     return parts[0].get("text", "").strip()
-            # some responses embed text differently
             if "text" in first:
                 return first["text"].strip()
-        return json.dumps(data)[:1000]
+        return "[summary unavailable]"
     except Exception as e:
         app.logger.exception("Gemini call failed")
-        return f"[error summarizing: {str(e)}]"
+        return "[error summarizing]"
 
 
 @app.route("/api/summaries/", methods=["POST", "GET"])
 def summaries():
-    """
-    POST: Accepts JSON { subreddits: [...], limit: N } -> fetch & summarize -> stores summaries in session
-    GET: Returns stored summaries if available (so Dashboard can do a GET on load)
-    """
     if "refresh_token" not in session:
         return jsonify({"error": "Not authenticated"}), 401
 
@@ -179,9 +159,8 @@ def summaries():
         subs = [s.strip() for s in subs if s and s.strip()]
         session["last_subs"] = subs
         limit = int(payload.get("limit", 5))
-    else:  # GET
+    else:
         subs = session.get("last_subs", []) or []
-        # allow override via query param ?limit=5
         try:
             limit = int(request.args.get("limit", 5))
         except Exception:
@@ -199,24 +178,25 @@ def summaries():
             subreddit = reddit.subreddit(sub)
             posts_iter = subreddit.top(time_filter="day", limit=limit)
         except Exception as e:
-            grouped.append({"subreddit": sub, "posts": [], "error": str(e)})
+            app.logger.warning(f"Failed to fetch subreddit {sub}: {e}")
             continue
 
         posts_list = []
+        prompts = []
+        post_meta = []
+
         for post in posts_iter:
             title = getattr(post, "title", "") or ""
             selftext = getattr(post, "selftext", "") or ""
-            url = getattr(post, "url", "") or (f"https://reddit.com{getattr(post, 'permalink','')}" )
+            permalink = f"https://reddit.com{getattr(post, 'permalink','')}"
             author = getattr(post, "author", "")
             score = getattr(post, "score", 0)
             comments = getattr(post, "num_comments", 0)
 
-            # --- NEW: collect body or fallback to top comments ---
             content = ""
             if selftext.strip():
                 content = (selftext[:3000] + "...") if len(selftext) > 3000 else selftext
             else:
-                # load top comments if no body
                 try:
                     post.comments.replace_more(limit=0)
                     top_comments = [c.body for c in post.comments[:3] if hasattr(c, "body")]
@@ -224,28 +204,37 @@ def summaries():
                         content = "Top comments:\n" + "\n\n".join(top_comments)
                 except Exception as e:
                     app.logger.warning(f"Could not fetch comments for post {post.id}: {e}")
-                    content = ""  # fallback
 
-            # --- build prompt with whatever context is available ---
-            prompt = f"Summarize this Reddit post in 2-4 concise sentences.\nTitle: {title}\n\nBody/Comments: {content}"
-
-            summary = call_gemini(prompt)
-
-            posts_list.append({
+            # Collect prompt for batching
+            prompts.append(f"Title: {title}\n\nBody/Comments: {content}\n\n---")
+            post_meta.append({
                 "id": getattr(post, "id", ""),
                 "title": title,
-                "summary": summary,
                 "score": score,
                 "comments": comments,
-                "url": url,
+                "url": permalink,   # ✅ always use reddit permalink
                 "author": str(author) if author else "unknown",
                 "subreddit": sub,
             })
 
+        if not prompts:
+            continue
 
-        grouped.append({"subreddit": sub, "posts": posts_list})
+        # Batch request: tell Gemini to separate each summary with @#$%
+        big_prompt = "Summarize each of the following Reddit posts in 2-4 concise sentences. " \
+                     "After each summary, write '@#$%'.\n\n" + "\n\n".join(prompts)
 
-    # cache results in session so Dashboard GET can return them
+        summaries_text = call_gemini(big_prompt)
+        summaries_split = [s.strip() for s in summaries_text.split("@#$%") if s.strip()]
+
+        # Assign back summaries
+        for meta, summ in zip(post_meta, summaries_split):
+            meta["summary"] = summ
+            posts_list.append(meta)
+
+        if posts_list:
+            grouped.append({"subreddit": sub, "posts": posts_list})
+
     session["summaries"] = grouped
     return jsonify(grouped), 200
 
