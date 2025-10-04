@@ -87,7 +87,7 @@ def callback():
         refresh_token = reddit.auth.authorize(code)
         session["refresh_token"] = refresh_token
         session.pop("oauth_state", None)
-        return redirect(f"{FRONTEND_URL}/")
+        return redirect(f"{FRONTEND_URL}/select")
     except Exception as e:
         app.logger.exception("Failed to authorize reddit code")
         return jsonify({"error": "authorization_failed", "detail": str(e)}), 500
