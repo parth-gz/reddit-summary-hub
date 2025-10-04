@@ -15,6 +15,15 @@ load_dotenv()
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8080").rstrip("/")
 
 app = Flask(__name__)
+# production cookie/security settings
+# NOTE: browsers require Secure + SameSite=None for cross-site cookies.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE=os.getenv("SESSION_COOKIE_SAMESITE", "None"),
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "true").lower() == "true",
+)
+# Optionally set FLASK_ENV or FLASK_DEBUG to control behavior
+
 CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": FRONTEND_URL}})
 
 app.secret_key = os.getenv("FLASK_SECRET", secrets.token_urlsafe(32))

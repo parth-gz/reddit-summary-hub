@@ -1,0 +1,6 @@
+Flask
+praw
+requests
+python-dotenv
+Flask-Cors
+gunicorn
