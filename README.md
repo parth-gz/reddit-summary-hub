@@ -38,4 +38,4 @@ npm run dev
 python backend/app.py
 ```
 
-
+For any bug or feature request, open a new issue.
